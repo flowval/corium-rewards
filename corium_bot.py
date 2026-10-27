@@ -35,8 +35,8 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 URL = "https://corium.so/points"
 NAMES = ["cosmi", "hnnicalls"]
 BOARDS = {
-    "Hunters": {"tab_text": "Hunters", "hash": "#hunters"},
-    "Community": {"tab_text": "Community", "hash": "#community"},
+    "Hunters": {"tab_re": r"^\s*Hunters.{0,2}\s*board\s*$", "hash": "#hunters"},
+    "Community": {"tab_re": r"^\s*Community\s*board\s*$", "hash": "#community"},
 }
 
 # Matches e.g. "12.34 SOL", "1,234 SOL", "◎ 5.2", "5.2◎"
@@ -73,11 +73,11 @@ FIND_ROWS_JS = """
     if (el.children.length > 0) continue;               // leaf nodes only
     const t = (el.textContent || '').trim().toLowerCase();
     if (!t || !t.includes(needle)) continue;
-    // climb to the row: first ancestor whose text also has a SOL/number figure
+    // climb to the row: first ancestor whose text has a decimal (SOL) figure
     let row = el;
     for (let i = 0; i < 5 && row.parentElement; i++) {
       row = row.parentElement;
-      if (/(sol|◎)/i.test(row.innerText || '')) break;
+      if (/\\d+\\.\\d+/.test(row.innerText || '')) break;
     }
     out.add((row.innerText || '').replace(/\\s+/g, ' ').trim());
   }
@@ -86,22 +86,31 @@ FIND_ROWS_JS = """
 """
 
 
+DEC_RE = re.compile(r"(\d[\d,]*\.\d+)")  # SOL amounts always have a decimal point
+ONCHAIN_RE = re.compile(r"(\d[\d,]*)\s*on[- ]?chain", re.IGNORECASE)
+LABEL = {"Hunters": "DUST", "Community": "weekly DUST"}
+
+
 def parse_sol(text: str) -> float | None:
-    """First SOL amount found in a row of text."""
-    m = SOL_RE.search(text)
-    if not m:
-        return None
-    return float((m.group(1) or m.group(2)).replace(",", ""))
+    """SOL = the decimal number in the row (dust/points are whole numbers)."""
+    m = DEC_RE.search(text or "")
+    return float(m.group(1).replace(",", "")) if m else None
 
 
 _scrape_lock = asyncio.Lock()
 
 
 def parse_dust(text: str) -> float | None:
-    m = DUST_RE.search(text or "")
-    if not m:
+    """Hunters: '509 on chain'. Community: the whole number just before the SOL amount."""
+    text = text or ""
+    m = ONCHAIN_RE.search(text)
+    if m:
+        return float(m.group(1).replace(",", ""))
+    d = DEC_RE.search(text)
+    if not d:
         return None
-    return float((m.group(1) or m.group(2)).replace(",", ""))
+    nums = re.findall(r"\d[\d,]*", text[: d.start()])
+    return float(nums[-1].replace(",", "")) if nums else None
 
 
 async def scrape() -> tuple[dict, list[str]]:
@@ -141,12 +150,12 @@ async def _scrape_impl() -> tuple[dict, list[str]]:
                 pass
             # try clicking the tab in case the hash alone doesn't switch it
             try:
-                await page.get_by_text(cfg["tab_text"], exact=False).first.click(
-                    timeout=3000
+                await page.get_by_text(re.compile(cfg["tab_re"], re.I)).first.click(
+                    timeout=5000
                 )
             except Exception:
                 pass
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(3000)
 
             # scroll a few times in case the list is lazy/virtualised
             seen: dict[str, str] = {}
@@ -195,7 +204,7 @@ def build_message(results: dict, offline_since: str | None = None) -> str:
     for board, names in results.items():
         lines.append(f"*{board}*")
         for name, d in names.items():
-            dust = f"  |  dust {d['dust']:,.4f}" if d.get("dust") is not None else ""
+            dust = f"  |  {LABEL[board]} {d['dust']:,.0f}" if d.get("dust") is not None else ""
             lines.append(f"  • {name}: {fmt(d['sol'])}{dust}")
             if d["sol"] is not None:
                 per_name[name] += d["sol"]
@@ -233,19 +242,20 @@ def diff_results(old: dict, new: dict) -> list[str]:
             if d.get("row") and not o.get("row"):
                 out.append(
                     f"➕ {name} appeared on {board}: {fmt(d['sol'])}"
-                    + (f", dust {d['dust']:,.4f}" if d.get("dust") is not None else "")
+                    + (f", {LABEL.get(board, 'dust')} {d['dust']:,.0f}" if d.get("dust") is not None else "")
                 )
                 continue
-            for field, label in (("sol", "SOL"), ("dust", "dust")):
+            for field, label in (("sol", "SOL"), ("dust", LABEL.get(board, "dust"))):
+                nd = 4 if field == "sol" else 0
                 a, b = o.get(field), d.get(field)
                 if b is None:
                     continue
                 if a is None:
-                    out.append(f"➕ {name} / {board}: {label} {b:,.4f} (new)")
+                    out.append(f"➕ {name} / {board}: {label} {b:,.{nd}f} (new)")
                 elif abs(b - a) > 1e-9:
                     arrow = "🟢 ▲" if b > a else "🔴 ▼"
                     out.append(
-                        f"{arrow} {name} / {board}: {label} {a:,.4f} → {b:,.4f} ({b - a:+,.4f})"
+                        f"{arrow} {name} / {board}: {label} {a:,.{nd}f} → {b:,.{nd}f} ({b - a:+,.{nd}f})"
                     )
     return out
 
