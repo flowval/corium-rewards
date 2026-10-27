@@ -60,6 +60,7 @@ DUST_RE = re.compile(
 )
 
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)  # its URLs contain the bot token
 log = logging.getLogger("corium")
 
 # JS run inside the page: find rows that contain a given name and return their text
@@ -129,7 +130,15 @@ async def _scrape_impl() -> tuple[dict, list[str]]:
         page.on("response", on_response)
 
         for board, cfg in BOARDS.items():
-            await page.goto(URL + cfg["hash"], wait_until="networkidle")
+            await page.goto(URL + cfg["hash"], wait_until="domcontentloaded", timeout=60000)
+            # the site keeps connections open, so never wait for "networkidle";
+            # wait until some SOL figure has rendered instead
+            try:
+                await page.wait_for_function(
+                    "/sol|◎/i.test(document.body.innerText)", timeout=25000
+                )
+            except Exception:
+                pass
             # try clicking the tab in case the hash alone doesn't switch it
             try:
                 await page.get_by_text(cfg["tab_text"], exact=False).first.click(
