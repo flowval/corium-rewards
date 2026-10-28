@@ -46,7 +46,7 @@ SOL_RE = re.compile(
 )
 
 CACHE_FILE = Path(__file__).with_name("corium_cache.json")
-REFRESH_MINUTES = int(os.environ.get("CHECK_MINUTES", "10"))  # auto-check interval
+REFRESH_MINUTES = int(os.environ.get("CHECK_MINUTES", "3"))  # auto-check interval
 
 # Chat IDs that get change alerts. On Render set NOTIFY_CHAT_ID (comma separated);
 # /notify also adds a chat but is forgotten on restart. If NOTIFY_CHAT_ID is set,
@@ -128,65 +128,126 @@ def parse_dust(text: str) -> float | None:
     return float(nums[-1].replace(",", "")) if nums else None
 
 
-async def scrape() -> tuple[dict, list[str]]:
-    """One browser at a time (Render instances have little RAM)."""
+LATEST: dict = {"results": None, "at": None}  # newest reading, kept in memory for instant replies
+_pw = None
+_browser = None
+
+
+async def get_browser():
+    """One Chromium for the life of the bot - launching it every time was the slowest part."""
+    global _pw, _browser
+    if _browser is None or not _browser.is_connected():
+        if _pw is None:
+            _pw = await async_playwright().start()
+        _browser = await _pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-extensions"],
+        )
+    return _browser
+
+
+async def reset_browser() -> None:
+    global _browser
+    try:
+        if _browser is not None:
+            await _browser.close()
+    except Exception:
+        pass
+    _browser = None
+
+
+async def new_page():
+    browser = await get_browser()
+    page = await browser.new_page(viewport={"width": 1400, "height": 1000})
+
+    async def skip_heavy(route):  # images/fonts/video aren't needed and slow the load
+        if route.request.resource_type in ("image", "media", "font"):
+            await route.abort()
+        else:
+            await route.continue_()
+
+    await page.route("**/*", skip_heavy)
+    return page
+
+
+async def wait_js(page, expr: str, timeout: int) -> None:
+    try:
+        await page.wait_for_function(expr, timeout=timeout)
+    except Exception:
+        pass
+
+
+async def scrape(probe: bool = False) -> tuple[dict, list[str]]:
+    """One scrape at a time (Render instances have little RAM)."""
     async with _scrape_lock:
-        return await _scrape_impl()
+        try:
+            results, urls = await _scrape_impl(probe)
+        except Exception:
+            await reset_browser()
+            raise
+    if has_data(results):
+        LATEST["results"] = merge_missing(LATEST["results"] or {}, results)
+        LATEST["at"] = datetime.now()
+    return results, urls
 
 
-async def _scrape_impl() -> tuple[dict, list[str]]:
-    """Return ({board: {name: {'sol': float|None, 'row': str|None}}}, json_urls)."""
+async def read_board(page, board: str) -> dict:
+    """Find the tracked names on the visible board; stop scrolling as soon as all are found."""
+    best: dict[str, tuple] = {}
+    for _ in range(8):
+        for name in NAMES:
+            for row in await page.evaluate(FIND_ROWS_JS, name):
+                if board == "Community" and ONCHAIN_RE.search(row):
+                    continue  # that's a Hunters row still on screen
+                key = (row_score(row, name), -len(row))
+                if key[0] >= 1 and (name not in best or key > best[name][0]):
+                    best[name] = (key, row)
+        if len(best) == len(NAMES):
+            break
+        await page.mouse.wheel(0, 1500)
+        await page.wait_for_timeout(250)
+    return {n: {"sol": parse_sol(r), "dust": parse_dust(r), "row": r} for n, (_k, r) in best.items()}
+
+
+async def _scrape_impl(probe: bool = False) -> tuple[dict, list[str]]:
+    """Return ({board: {name: {'sol', 'dust', 'row'}}}, json_urls)."""
     results = {b: {n: {"sol": None, "dust": None, "row": None} for n in NAMES} for b in BOARDS}
     json_urls: list[str] = []
+    page = await new_page()
+    tasks: list = []
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-        )
-        page = await browser.new_page(viewport={"width": 1400, "height": 1000})
+    async def note(resp):
+        """Remember JSON calls the page makes; in probe mode, flag the ones carrying our names."""
+        try:
+            if "json" not in resp.headers.get("content-type", ""):
+                return
+            tag = ""
+            if probe:
+                body = (await resp.text()).lower()
+                if any(n in body for n in NAMES):
+                    tag = "★ "
+            # query strings are dropped: they can carry keys or tokens
+            json_urls.append(f"{tag}{resp.request.method} {resp.url.split('?')[0]}")
+        except Exception:
+            pass
 
-        def on_response(resp):
-            ct = resp.headers.get("content-type", "")
-            if "json" in ct:
-                json_urls.append(resp.url)
-
-        page.on("response", on_response)
-
+    try:
+        page.on("response", lambda resp: tasks.append(asyncio.create_task(note(resp))))
         for board, cfg in BOARDS.items():
-            await page.goto(URL + cfg["hash"], wait_until="domcontentloaded", timeout=60000)
-            # the site keeps connections open, so never wait for "networkidle";
-            # wait until some SOL figure has rendered instead
+            await page.goto(URL + cfg["hash"], wait_until="domcontentloaded", timeout=45000)
+            # the site keeps connections open, so never wait for "networkidle"
+            await wait_js(page, "/sol|◎/i.test(document.body.innerText)", 15000)
             try:
-                await page.wait_for_function(
-                    "/sol|◎/i.test(document.body.innerText)", timeout=25000
-                )
+                await page.get_by_text(re.compile(cfg["tab_re"], re.I)).first.click(timeout=3000)
             except Exception:
                 pass
-            # try clicking the tab in case the hash alone doesn't switch it
-            try:
-                await page.get_by_text(re.compile(cfg["tab_re"], re.I)).first.click(
-                    timeout=5000
-                )
-            except Exception:
-                pass
-            await page.wait_for_timeout(3000)
-
-            # scroll a few times in case the list is lazy/virtualised
-            best: dict[str, tuple] = {}
-            for _ in range(8):
-                for name in NAMES:
-                    for row in await page.evaluate(FIND_ROWS_JS, name):
-                        key = (row_score(row, name), -len(row))
-                        if key[0] >= 1 and (name not in best or key > best[name][0]):
-                            best[name] = (key, row)
-                await page.mouse.wheel(0, 1500)
-                await page.wait_for_timeout(600)
-
-            for name, (_key, row) in best.items():
-                results[board][name] = {"sol": parse_sol(row), "dust": parse_dust(row), "row": row}
-
-        await browser.close()
+            # wait until the right board is showing: only Hunters has "on chain"
+            marker = "/on chain/i.test(document.body.innerText)"
+            await wait_js(page, marker if board == "Hunters" else "!" + marker, 8000)
+            results[board].update(await read_board(page, board))
+        await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        await page.close()
     return results, json_urls
 
 
@@ -208,10 +269,12 @@ def fmt(x: float | None) -> str:
     return "not found" if x is None else f"{x:,.4f} SOL"
 
 
-def build_message(results: dict, offline_since: str | None = None) -> str:
+def build_message(results: dict, offline_since: str | None = None, note: str | None = None) -> str:
     lines = ["📊 *Corium update*"]
     if offline_since:
         lines.append(f"📴 _Offline, showing saved data from {offline_since}_")
+    if note:
+        lines.append(note)
     lines.append("")
     per_name = {n: 0.0 for n in NAMES}
     per_board = {b: 0.0 for b in BOARDS}
@@ -356,24 +419,46 @@ async def stop_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔕 Alerts off for this chat.")
 
 
+def age_text(at: datetime) -> str:
+    secs = int((datetime.now() - at).total_seconds())
+    return f"{secs}s ago" if secs < 90 else f"{secs // 60} min ago"
+
+
+async def refresh_message(msg, bot, shown: dict | None) -> None:
+    """Scrape in the background, then swap the instant reply for fresh numbers."""
+    try:
+        results, _ = await scrape()
+        await process_results(bot, results)
+        text = build_message(LATEST["results"] if has_data(results) else results)
+    except Exception as e:
+        log.warning("refresh failed: %s", safe_err(e))
+        text = (
+            build_message(shown, note="⚠️ _couldn't refresh, showing the last reading_")
+            if shown
+            else f"❌ Couldn't read Corium: {safe_err(e)}"
+        )
+    try:
+        await msg.edit_text(text, parse_mode="Markdown")
+    except Exception:
+        pass  # Telegram refuses an edit that changes nothing
+
+
 async def update_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
-    msg = await update.message.reply_text("⏳ Checking Corium...")
-    try:
-        results, _ = await scrape()
-        await process_results(ctx.bot, results)
-        await msg.edit_text(build_message(results), parse_mode="Markdown")
-    except Exception as e:
-        log.exception("scrape failed")
+    shown, at = LATEST["results"], LATEST["at"]
+    if shown is None:  # nothing in memory yet (just started) - try the saved file
         cached = load_cache()
         if cached:
-            results, saved_at = cached
-            await msg.edit_text(
-                build_message(results, offline_since=saved_at), parse_mode="Markdown"
-            )
-        else:
-            await msg.edit_text(f"❌ Failed and no saved data yet: {e}")
+            shown, at = cached[0], datetime.fromisoformat(cached[1])
+    if shown is not None and at is not None:
+        # answer instantly with the newest reading, then refresh it in the background
+        msg = await update.message.reply_text(
+            build_message(shown, note=f"⚡ _{age_text(at)}, refreshing..._"), parse_mode="Markdown"
+        )
+    else:
+        msg = await update.message.reply_text("⏳ First check, one moment...")
+    ctx.application.create_task(refresh_message(msg, ctx.bot, shown))
 
 
 async def debug_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -382,12 +467,12 @@ async def debug_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     msg = await update.message.reply_text("⏳ Debugging...")
     try:
-        results, urls = await scrape()
+        results, urls = await scrape(probe=True)
         out = []
         for b, ns in results.items():
             for n, d in ns.items():
                 out.append(f"{b}/{n}: {d['row']}")
-        out.append("\nJSON endpoints:\n" + "\n".join(sorted(set(urls))[:20]))
+        out.append("\nJSON calls (★ = response contains your names):\n" + "\n".join(sorted(set(urls), key=lambda u: (not u.startswith("★"), u))[:25]))
         await msg.edit_text("\n".join(out)[:4000])
     except Exception as e:
         await msg.edit_text(f"❌ {e}")
@@ -713,24 +798,70 @@ def find_lists(obj, out: list) -> None:
             find_lists(v, out)
 
 
+DEAD_STATES = {"closed", "expired", "refunded", "paid", "settled", "graduated", "cancelled",
+               "canceled", "ended", "completed", "won", "finished", "claimed", "failed"}
+NAME_KEYS += ["coinSymbol", "tokenSymbol", "coinName", "tokenName"]
+
+
+def to_ts(v) -> float | None:
+    """Epoch seconds, epoch milliseconds or an ISO date -> seconds."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+        return v / 1000 if v > 1e11 else float(v)
+    if isinstance(v, str):
+        try:
+            return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def flat_pairs(it: dict) -> list:
+    """The item's own fields plus one level of nested objects (e.g. a 'coin' object)."""
+    out = []
+    for k, v in it.items():
+        out.append((k, v))
+        if isinstance(v, dict):
+            out.extend(v.items())
+    return out
+
+
 def normalize_bounty(it: dict) -> dict:
+    pairs = flat_pairs(it)
     ident = next((f"{k}:{it[k]}" for k in ID_KEYS if isinstance(it.get(k), (str, int))), None)
-    name = next((str(it[k]) for k in NAME_KEYS if isinstance(it.get(k), str) and it[k]), None)
+    name = next((str(v) for k, v in pairs if k in NAME_KEYS and isinstance(v, str) and v), None)
     amount = None
     for k, v in it.items():
         if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 and AMT_HINT.search(k):
             amount = float(v) / 1e9 if v >= 1e6 else float(v)  # lamports -> SOL
             break
+    own_id = str(it.get("id", ""))
     mint = next(
-        (v for v in it.values() if isinstance(v, str) and 32 <= len(v) <= 44 and v.endswith("pump")),
+        (v for k, v in pairs
+         if isinstance(v, str) and 32 <= len(v) <= 44 and v != own_id
+         and re.search(r"mint|coin|token|pool", k, re.IGNORECASE)),
+        None,
+    ) or next(
+        (v for _k, v in pairs if isinstance(v, str) and 32 <= len(v) <= 44 and v.endswith("pump")),
         None,
     )
+    deadline = next(
+        (to_ts(v) for k, v in pairs if re.search(r"deadline|expir|ends?_?at|end_?time", k, re.IGNORECASE) and to_ts(v)),
+        None,
+    )
+    status = next(
+        (str(v) for k, v in pairs if re.fullmatch(r"status|state", k, re.IGNORECASE) and isinstance(v, str)),
+        "",
+    )
+    live = status.lower() not in DEAD_STATES and not (deadline and deadline < datetime.now().timestamp())
     return {
         "id": ident or json.dumps(it, sort_keys=True)[:200],
         "name": name,
+        "kind": str(it.get("kind") or ""),
         "amount": amount,
         "mint": mint,
-        "text": json.dumps(it)[:300],
+        "deadline": deadline,
+        "live": live,
+        "text": json.dumps(it)[:400],
     }
 
 
@@ -755,6 +886,9 @@ def pick_bounty_items(payloads: list, dom: list) -> list[dict]:
                 "name": a["text"][:60],
                 "amount": float(m.group(1).replace(",", "")) if m else None,
                 "mint": None,
+                "kind": "",
+                "deadline": None,
+                "live": True,
                 "text": a["text"],
             }
         )
@@ -773,55 +907,89 @@ async def scrape_bounties() -> list[dict]:
             pass
 
     async with _scrape_lock:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-            )
-            page = await browser.new_page(viewport={"width": 1400, "height": 1000})
-            page.on("response", lambda r: tasks.append(asyncio.create_task(grab(r))))
-            await page.goto(BOUNTY_URL, wait_until="domcontentloaded", timeout=60000)
+        try:
+            page = await new_page()
             try:
-                await page.wait_for_function("/sol|◎/i.test(document.body.innerText)", timeout=25000)
-            except Exception:
-                pass
-            await page.wait_for_timeout(4000)
-            dom = await page.evaluate(ANCHOR_JS)
-            await asyncio.gather(*tasks, return_exceptions=True)
-            await browser.close()
+                page.on("response", lambda r: tasks.append(asyncio.create_task(grab(r))))
+                await page.goto(BOUNTY_URL, wait_until="domcontentloaded", timeout=45000)
+                await wait_js(page, "/sol|◎/i.test(document.body.innerText)", 15000)
+                await page.wait_for_timeout(1500)
+                dom = await page.evaluate(ANCHOR_JS)
+                await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                await page.close()
+        except Exception:
+            await reset_browser()
+            raise
     return pick_bounty_items(payloads, dom)
 
 
+def remaining(ts: float) -> str:
+    secs = int(ts - datetime.now().timestamp())
+    if secs <= 0:
+        return "now"
+    d, rem = divmod(secs, 86400)
+    h, rem = divmod(rem, 3600)
+    return f"in {d}d {h}h" if d else (f"in {h}h {rem // 60}m" if h else f"in {rem // 60}m")
+
+
 def bounty_line(i: dict) -> str:
-    label = i["name"] or i["text"][:60]
-    amt = f" - {i['amount']:.2f} SOL" if i["amount"] is not None else ""
-    return f"{label}{amt}"
+    label = i["name"] or (i["mint"][:6] + "…" if i["mint"] else i["id"].split(":")[-1][:6] + "…")
+    parts = [label]
+    if i["amount"] is not None:
+        parts.append(f"{i['amount']:.2f} SOL")
+    if i.get("deadline"):
+        parts.append(f"ends {remaining(i['deadline'])}")
+    return " - ".join(parts)
+
+
+def bounty_link(i: dict) -> str:
+    if not i["mint"]:
+        return ""
+    if i["mint"].endswith("pump"):
+        return f"\nhttps://pump.fun/coin/{i['mint']}"
+    return f"\nhttps://solscan.io/token/{i['mint']}"
+
+
+def live_bounties(items: list[dict]) -> list[dict]:
+    """Open bounties only: not expired/paid, and not 'requests' (those are a different thing)."""
+    return [i for i in items if i["live"] and "request" not in i.get("kind", "").lower()]
+
+
+async def send_all(bot, text: str) -> None:
+    for cid in SUBSCRIBERS:
+        try:
+            await bot.send_message(cid, text, disable_web_page_preview=True)
+        except Exception:
+            log.exception("could not notify %s", cid)
 
 
 async def bounty_watcher(bot):
     known = None
     while True:
         try:
-            items = await scrape_bounties()
+            all_items = await scrape_bounties()
+            items = live_bounties(all_items)
             BOUNTY_STATE.update(count=len(items), last_check=datetime.now().isoformat(timespec="seconds"), error=None)
-            if items:
+            if all_items:
                 ids = {i["id"] for i in items}
                 if known is None:
-                    known = ids  # baseline, no alerts for bounties that already exist
+                    known = ids
+                    if items:  # one summary of what is live right now, then only new ones
+                        top = sorted(items, key=lambda i: i["amount"] or 0, reverse=True)[:5]
+                        await send_all(
+                            bot,
+                            f"💰 {len(items)} live bounties right now:\n"
+                            + "\n".join(f"• {bounty_line(i)}" for i in top)
+                            + f"\n\n{BOUNTY_URL}",
+                        )
                 else:
                     new = [i for i in items if i["id"] not in known]
                     known |= ids
                     for i in new[:5]:
-                        link = f"\nhttps://pump.fun/coin/{i['mint']}" if i["mint"] else ""
-                        text = f"💰 New bounty on Corium\n{bounty_line(i)}{link}\n{BOUNTY_URL}"
-                        for cid in SUBSCRIBERS:
-                            try:
-                                await bot.send_message(cid, text)
-                            except Exception:
-                                log.exception("could not notify %s", cid)
+                        await send_all(bot, f"💰 New bounty live\n{bounty_line(i)}{bounty_link(i)}\n{BOUNTY_URL}")
                     if len(new) > 5:
-                        for cid in SUBSCRIBERS:
-                            await bot.send_message(cid, f"...and {len(new) - 5} more new bounties: {BOUNTY_URL}")
+                        await send_all(bot, f"...and {len(new) - 5} more new bounties: {BOUNTY_URL}")
         except Exception as e:
             BOUNTY_STATE["error"] = safe_err(e)
             log.warning("bounty watcher: %s", BOUNTY_STATE["error"])
@@ -833,27 +1001,33 @@ async def bounties_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     msg = await update.message.reply_text("⏳ Reading the bounty board...")
     try:
-        items = await scrape_bounties()
+        all_items = await scrape_bounties()
     except Exception as e:
         await msg.edit_text(f"❌ {safe_err(e)}")
         return
+    items = live_bounties(all_items)
     if not items:
-        await msg.edit_text("No bounties could be read from the page (or none are open).")
+        await msg.edit_text(f"No live bounties found ({len(all_items)} entries on the board).")
         return
-    lines = [f"💰 {len(items)} bounties found:"] + [f"  • {bounty_line(i)}" for i in items[:15]]
+    top = sorted(items, key=lambda i: i["amount"] or 0, reverse=True)[:15]
+    lines = [f"💰 {len(items)} live bounties ({len(all_items)} entries on the board):"]
+    lines += [f"• {bounty_line(i)}" for i in top]
+    if not any(i["name"] for i in items):  # couldn't read coin names - show the raw shape so it can be fixed
+        lines.append(f"\n(no coin names found, raw sample: {items[0]['text'][:350]})")
     await msg.edit_text("\n".join(lines))
 
 
 async def background_refresh(bot):
-    """Keeps the cache fresh; silently skips when offline."""
+    """Keeps the readings fresh and sends alerts; silently skips when offline."""
     while True:
         try:
             results, _ = await scrape()
             await process_results(bot, results)
             log.info("checked")
         except Exception as e:
-            log.warning("refresh skipped (offline?): %s", e)
-        await asyncio.sleep(REFRESH_MINUTES * 60)
+            log.warning("refresh skipped (offline?): %s", safe_err(e))
+        # a change was just seen once: re-check in 40s to confirm it, don't wait a full interval
+        await asyncio.sleep(40 if _pending is not None else REFRESH_MINUTES * 60)
 
 
 async def post_init(app: Application):
@@ -884,7 +1058,7 @@ def start_health_server(port: int) -> None:
 
 def main():
     token = os.environ["TELEGRAM_BOT_TOKEN"]
-    app = Application.builder().token(token).post_init(post_init).build()
+    app = Application.builder().token(token).concurrent_updates(True).post_init(post_init).build()
     app.add_handler(CommandHandler("update", update_cmd))
     app.add_handler(CommandHandler("debug", debug_cmd))
     app.add_handler(CommandHandler("notify", notify_cmd))
