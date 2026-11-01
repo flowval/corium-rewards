@@ -1,7 +1,7 @@
 """
 Corium points tracker - Telegram bot
-Command: /update  -> checks Hunters + Community boards for the tracked names
-                     and replies with individual + combined SOL totals.
+Command: /update or /updates -> checks Hunters + Community boards for the tracked names
+                                and replies with individual + combined SOL totals.
 
 Run locally:
     pip install -r requirements.txt && playwright install chromium
@@ -279,14 +279,18 @@ def build_message(results: dict, offline_since: str | None = None, note: str | N
     per_name = {n: 0.0 for n in NAMES}
     per_board = {b: 0.0 for b in BOARDS}
 
-    for board, names in results.items():
+    for board in BOARDS:
+        names_dict = results.get(board, {})
         lines.append(f"*{board}*")
-        for name, d in names.items():
-            dust = f"  |  {LABEL[board]} {d['dust']:,.0f}" if d.get("dust") is not None else ""
-            lines.append(f"  • {name}: {fmt(d['sol'])}{dust}")
-            if d["sol"] is not None:
-                per_name[name] += d["sol"]
-                per_board[board] += d["sol"]
+        for name in NAMES:
+            d = names_dict.get(name, {"sol": None, "dust": None})
+            sol_val = d.get("sol")
+            dust_val = d.get("dust")
+            dust = f"  |  {LABEL[board]} {dust_val:,.0f}" if dust_val is not None else ""
+            lines.append(f"  • {name}: {fmt(sol_val)}{dust}")
+            if sol_val is not None:
+                per_name[name] += sol_val
+                per_board[board] += sol_val
         lines.append(f"  ↳ all {len(NAMES)} accounts: {per_board[board]:,.4f} SOL")
         lines.append("")
 
@@ -297,7 +301,10 @@ def build_message(results: dict, offline_since: str | None = None, note: str | N
     lines.append(f"*TOTAL combined: {sum(per_name.values()):,.4f} SOL*")
 
     missing = [
-        f"{b}/{n}" for b, ns in results.items() for n, d in ns.items() if d["sol"] is None
+        f"{b}/{n}"
+        for b in BOARDS
+        for n in NAMES
+        if results.get(b, {}).get(n, {}).get("sol") is None
     ]
     if missing:
         lines += ["", "⚠️ Could not read: " + ", ".join(missing)]
@@ -306,7 +313,7 @@ def build_message(results: dict, offline_since: str | None = None, note: str | N
 
 def has_data(results: dict) -> bool:
     return any(
-        d["sol"] is not None or d.get("dust") is not None
+        d.get("sol") is not None or d.get("dust") is not None
         for ns in results.values()
         for d in ns.values()
     )
@@ -314,12 +321,14 @@ def has_data(results: dict) -> bool:
 
 def diff_results(old: dict, new: dict) -> list[str]:
     out = []
-    for board, names in new.items():
-        for name, d in names.items():
+    for board in BOARDS:
+        names = new.get(board, {})
+        for name in NAMES:
+            d = names.get(name, {})
             o = old.get(board, {}).get(name, {})
             if d.get("row") and not o.get("row"):
                 out.append(
-                    f"➕ {name} appeared on {board}: {fmt(d['sol'])}"
+                    f"➕ {name} appeared on {board}: {fmt(d.get('sol'))}"
                     + (f", {LABEL.get(board, 'dust')} {d['dust']:,.0f}" if d.get("dust") is not None else "")
                 )
                 continue
@@ -343,20 +352,27 @@ _pending = None  # signature of a change waiting for a second matching reading
 
 def signature(results: dict) -> tuple:
     return tuple(
-        (b, n, d.get("sol"), d.get("dust"))
-        for b, ns in sorted(results.items())
-        for n, d in sorted(ns.items())
+        (b, n, results.get(b, {}).get(n, {}).get("sol"), results.get(b, {}).get(n, {}).get("dust"))
+        for b in sorted(BOARDS)
+        for n in sorted(NAMES)
     )
 
 
 def merge_missing(old: dict, new: dict) -> dict:
     """If a name wasn't found this time, keep its previous reading."""
-    out = {b: {n: dict(d) for n, d in ns.items()} for b, ns in new.items()}
-    for b, ns in out.items():
-        for n, d in ns.items():
+    out = {
+        b: {
+            n: dict(new.get(b, {}).get(n, {"sol": None, "dust": None, "row": None}))
+            for n in NAMES
+        }
+        for b in BOARDS
+    }
+    for b in BOARDS:
+        for n in NAMES:
+            d = out[b][n]
             prev = old.get(b, {}).get(n)
             if d.get("row") is None and prev and prev.get("row"):
-                out[b][n] = prev
+                out[b][n] = dict(prev)
     return out
 
 
@@ -384,7 +400,11 @@ async def process_results(bot, results: dict) -> None:
     save_cache(results)
     if not SUBSCRIBERS:
         return
-    total = sum(d["sol"] or 0 for ns in results.values() for d in ns.values())
+    total = sum(
+        results.get(b, {}).get(n, {}).get("sol") or 0
+        for b in BOARDS
+        for n in NAMES
+    )
     text = "🔔 Corium change\n" + "\n".join(changes) + f"\n\nTotal combined: {total:,.4f} SOL"
     for cid in SUBSCRIBERS:
         try:
@@ -1059,7 +1079,7 @@ def start_health_server(port: int) -> None:
 def main():
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     app = Application.builder().token(token).concurrent_updates(True).post_init(post_init).build()
-    app.add_handler(CommandHandler("update", update_cmd))
+    app.add_handler(CommandHandler(["update", "updates"], update_cmd))
     app.add_handler(CommandHandler("debug", debug_cmd))
     app.add_handler(CommandHandler("notify", notify_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
