@@ -34,7 +34,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 URL = "https://corium.so/points"
-NAMES = ["cosmi", "hnnicalls"]
+NAMES = ["cosmi", "hnnicalls", "xpweb3"]
 BOARDS = {
     "Hunters": {"tab_re": r"^\s*Hunters.{0,2}\s*board\s*$", "hash": "#hunters"},
     "Community": {"tab_re": r"^\s*Community\s*board\s*$", "hash": "#community"},
