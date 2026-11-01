@@ -71,7 +71,7 @@ FIND_ROWS_JS = """
   const out = new Set();
   const all = document.querySelectorAll('body *');
   for (const el of all) {
-    if (el.children.length > 0) continue;               // leaf nodes only
+    if (el.children.length > 0) continue;                // leaf nodes only
     const t = (el.textContent || '').trim().toLowerCase();
     if (!t || !t.includes(needle)) continue;
     // climb to the row: first ancestor whose text has a decimal (SOL) figure
@@ -194,7 +194,7 @@ async def scrape(probe: bool = False) -> tuple[dict, list[str]]:
 async def read_board(page, board: str) -> dict:
     """Find the tracked names on the visible board; stop scrolling as soon as all are found."""
     best: dict[str, tuple] = {}
-    for _ in range(8):
+    for _ in range(15):
         for name in NAMES:
             for row in await page.evaluate(FIND_ROWS_JS, name):
                 if board == "Community" and ONCHAIN_RE.search(row):
@@ -287,7 +287,7 @@ def build_message(results: dict, offline_since: str | None = None, note: str | N
             if d["sol"] is not None:
                 per_name[name] += d["sol"]
                 per_board[board] += d["sol"]
-        lines.append(f"  ↳ both accounts: {per_board[board]:,.4f} SOL")
+        lines.append(f"  ↳ all {len(NAMES)} accounts: {per_board[board]:,.4f} SOL")
         lines.append("")
 
     lines.append("*Per account (Hunters + Community)*")
@@ -1071,7 +1071,7 @@ def main():
     # pingers see "healthy" and the free service stays awake.
     if os.environ.get("RENDER_EXTERNAL_URL"):
         start_health_server(int(os.environ.get("PORT", "10000")))
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
